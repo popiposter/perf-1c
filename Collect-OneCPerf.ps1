@@ -62,6 +62,7 @@ $script:Failures = @{}
 $script:Disabled = @{}
 $script:Coverage = @{}
 $script:SqlConnections = @{}
+$script:SqlErrorHints = @{}
 $script:RuntimeSqlAllowed = $false
 $script:Major = 0
 $script:Tick = -1
@@ -69,7 +70,7 @@ $script:LastRecord = $null
 $maxBytes = [long]$MaxOutputMB * 1MB
 $stopReason = 'interrupted_or_incomplete'
 $manifest = [ordered]@{
-    schema_version='0.1'; collector_version='0.1.2-pilot'; case_id=$CaseId;
+    schema_version='0.1'; collector_version='0.1.3-pilot'; case_id=$CaseId;
     source_commit=$SourceCommit; collector_pid=$PID; powershell_version=$PSVersionTable.PSVersion.ToString();
     powershell_edition=$PSVersionTable.PSEdition; dotnet_version=[Environment]::Version.ToString();
     collector_sha256=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant();
@@ -107,6 +108,22 @@ function Emit-Record {
     if ($c.Contains($state)) { $c[$state]++ }
     $c.total_ms += [double]$Record.duration_ms
 }
+function Get-OneCPerfSqlErrorHint {
+    # Conservative message classification, not a certificate inspection or login test.
+    # Unknown TLS errors, permissions and other sources must not suggest bypassing trust.
+    param([string]$Source,[string]$Message)
+    if ($Source -notlike 'sql.*') { return $null }
+    $untrusted = $Message -match '(?i)certificate chain was issued by an authority that is not trusted' -or
+        $Message -match '(?i)цепочка сертификатов выпущена центром сертификации, не имеющим доверия'
+    if (-not $untrusted) { return $null }
+    [pscustomobject]@{
+        error_kind='sql_certificate_untrusted'
+        suggested_action=('SQL certificate trust validation failed. Configure a verifiable server certificate and trusted CA chain. ' +
+            'For a temporary diagnostic run against an explicitly trusted endpoint, the operator may add -TrustServerCertificate. ' +
+            'Encrypt=True remains enabled, but server identity is not validated. No automatic retry or security downgrade is performed. ' +
+            'If that switch is already set, investigate the actual endpoint/provider. This error does not establish a login, permission or performance problem.')
+    }
+}
 function Collect-Source {
     param([string]$Source,[scriptblock]$Action,[int]$Limit=5000)
     if ($script:OutputBytes -ge $maxBytes) { return }
@@ -122,15 +139,27 @@ function Collect-Source {
             ended_utc=[DateTime]::UtcNow.ToString('o');duration_ms=$sw.Elapsed.TotalMilliseconds;
             row_count=$rows.Count;row_limit=$Limit;rows=$rows;error=$null}
     } catch {
+        $errorMessage=$_.Exception.Message
+        $errorKind=$null; $suggestedAction=$null
+        $sqlHint=Get-OneCPerfSqlErrorHint -Source $Source -Message $errorMessage
+        if ($null -ne $sqlHint) {
+            $errorKind=$sqlHint.error_kind
+            $suggestedAction=$sqlHint.suggested_action
+            if (-not $script:SqlErrorHints.ContainsKey($errorKind)) {
+                $script:SqlErrorHints[$errorKind]=$suggestedAction
+                Write-Warning $suggestedAction
+            }
+        }
         if (-not $script:Failures.ContainsKey($Source)) { $script:Failures[$Source]=0 }
         $script:Failures[$Source]++
         if ($script:Failures[$Source] -eq 1) {
-            Write-Warning ('Source '+$Source+' failed: '+$_.Exception.Message)
+            Write-Warning ('Source '+$Source+' failed: '+$errorMessage)
         }
         if ($script:Failures[$Source] -ge 3) { $script:Disabled[$Source]=$true }
         Emit-Record @{source=$Source;status='error';collected_utc=$t.ToString('o');
             ended_utc=[DateTime]::UtcNow.ToString('o');duration_ms=$sw.Elapsed.TotalMilliseconds;
-            row_count=0;rows=@();error=$_.Exception.Message;
+            row_count=0;rows=@();error=$errorMessage;
+            error_kind=$errorKind;suggested_action=$suggestedAction;
             disabled_after_three_errors=$script:Disabled.ContainsKey($Source)}
     }
 }
@@ -159,7 +188,7 @@ function New-OneCPerfSqlConnection {
     # provider's canonical keywords, not property names such as DataSource.
     $builder['Data Source']=$Instance
     $builder['Initial Catalog']=$Catalog
-    $builder['Application Name']='OneCPerfDiag/0.1.2'
+    $builder['Application Name']='OneCPerfDiag/0.1.3'
     $builder['Connect Timeout']=$TimeoutSeconds
     $builder['Encrypt']=$true
     $builder['TrustServerCertificate']=$TrustCertificate
@@ -237,6 +266,9 @@ Save-Manifest
 Write-Host ('Collector: '+$manifest.collector_version+'; source commit: '+$SourceCommit)
 Write-Host ('Output: '+$root)
 Write-Host 'Read-only pilot. Press Ctrl+C to stop. No services or tracing sessions will be left running.'
+if (-not $SkipSql -and $TrustServerCertificate) {
+    Write-Warning 'Operator selected -TrustServerCertificate for SQL only: Encrypt=True, server certificate validation bypassed. HTTPS download validation is unchanged.'
+}
 try {
     Ensure-Space
     Collect-Source 'windows.computer' { Read-Cim 'Win32_ComputerSystem' @('Manufacturer','Model','TotalPhysicalMemory','NumberOfLogicalProcessors','NumberOfProcessors','HypervisorPresent') }
@@ -328,6 +360,10 @@ try {
     if ($script:Coverage.ContainsKey('sql.epoch')) { $sqlRuntimeSamples=[int]$script:Coverage['sql.epoch'].ok }
     $manifest['source_error_count']=$sourceErrors
     $manifest['sql_runtime_sample_count']=$sqlRuntimeSamples
+    $sqlDiagnostics=@($script:SqlErrorHints.Keys | Sort-Object | ForEach-Object {
+        [pscustomobject]@{error_kind=$_;suggested_action=$script:SqlErrorHints[$_]}
+    })
+    $manifest['sql_connection_diagnostics']=$sqlDiagnostics
     if ($sourceErrors -gt 0) {
         Write-Warning ('Capture contains '+$sourceErrors+' source errors. Completed means the timer ended, not complete diagnostic coverage.')
     }
@@ -339,6 +375,10 @@ try {
     [IO.File]::WriteAllText((Join-Path $root 'coverage.json'),(ConvertTo-Json -InputObject $coverage -Depth 6),$utf8)
     $table=$coverage | ConvertTo-Html -Fragment
     $intro='<h1>1C / SQL diagnostic capture</h1><p>Coverage report, NOT a health verdict. Missing/truncated sources are NOT healthy results.</p><p>Run analyze.py on an administrator workstation for interval analysis. No Python is needed on the server.</p><p>Confidential: review before transferring. Includes machine/database names and paths. SQL text and plans are not included.</p>'
+    if ($sqlDiagnostics.Count -gt 0) {
+        $hintTable=$sqlDiagnostics | ConvertTo-Html -Fragment
+        $intro += '<h2>SQL connection diagnostics</h2>'+($hintTable -join "`n")
+    }
     $html=ConvertTo-Html -Title 'Diagnostic capture coverage' -Body ($intro+($table -join "`n"))
     [IO.File]::WriteAllText((Join-Path $root 'coverage.html'),($html -join "`n"),$utf8)
     try {
