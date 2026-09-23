@@ -69,8 +69,8 @@ $script:LastRecord = $null
 $maxBytes = [long]$MaxOutputMB * 1MB
 $stopReason = 'interrupted_or_incomplete'
 $manifest = [ordered]@{
-    schema_version='0.1'; collector_version='0.1.1-pilot'; case_id=$CaseId;
-    source_commit=$SourceCommit; powershell_version=$PSVersionTable.PSVersion.ToString();
+    schema_version='0.1'; collector_version='0.1.2-pilot'; case_id=$CaseId;
+    source_commit=$SourceCommit; collector_pid=$PID; powershell_version=$PSVersionTable.PSVersion.ToString();
     powershell_edition=$PSVersionTable.PSEdition; dotnet_version=[Environment]::Version.ToString();
     collector_sha256=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant();
     host=$env:COMPUTERNAME; role=$Role; started_utc=$started.ToString('o');
@@ -124,6 +124,9 @@ function Collect-Source {
     } catch {
         if (-not $script:Failures.ContainsKey($Source)) { $script:Failures[$Source]=0 }
         $script:Failures[$Source]++
+        if ($script:Failures[$Source] -eq 1) {
+            Write-Warning ('Source '+$Source+' failed: '+$_.Exception.Message)
+        }
         if ($script:Failures[$Source] -ge 3) { $script:Disabled[$Source]=$true }
         Emit-Record @{source=$Source;status='error';collected_utc=$t.ToString('o');
             ended_utc=[DateTime]::UtcNow.ToString('o');duration_ms=$sw.Elapsed.TotalMilliseconds;
@@ -142,30 +145,46 @@ function Read-Cim {
     if ($Filter) { $argsCim.Filter=$Filter }
     Get-CimInstance @argsCim | Select-Object -Property $Fields
 }
+function New-OneCPerfSqlConnection {
+    # Construct without connecting, so tests exercise the real connection-string path.
+    param(
+        [string]$Instance,
+        [string]$Catalog,
+        [int]$TimeoutSeconds = 3,
+        [bool]$TrustCertificate = $false,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    $builder=New-Object System.Data.SqlClient.SqlConnectionStringBuilder
+    # PowerShell can adapt this IDictionary before its CLR properties. Use the
+    # provider's canonical keywords, not property names such as DataSource.
+    $builder['Data Source']=$Instance
+    $builder['Initial Catalog']=$Catalog
+    $builder['Application Name']='OneCPerfDiag/0.1.2'
+    $builder['Connect Timeout']=$TimeoutSeconds
+    $builder['Encrypt']=$true
+    $builder['TrustServerCertificate']=$TrustCertificate
+    $builder['Persist Security Info']=$false
+    $builder['Pooling']=$false
+    $builder['Integrated Security']=($null -eq $Credential)
+    $conn=New-Object System.Data.SqlClient.SqlConnection
+    try {
+        $conn.ConnectionString=$builder.get_ConnectionString()
+        if ($null -ne $Credential) {
+            $secure=$Credential.Password.Copy()
+            $secure.MakeReadOnly()
+            $conn.Credential=New-Object System.Data.SqlClient.SqlCredential($Credential.UserName,$secure)
+        }
+        return $conn
+    } catch {
+        $conn.Dispose()
+        throw
+    }
+}
 function Get-SqlConnection {
     param([string]$Catalog)
     if (-not $script:SqlConnections.ContainsKey($Catalog)) {
-        $builder=New-Object System.Data.SqlClient.SqlConnectionStringBuilder
-        $builder.DataSource=$SqlInstance
-        $builder.InitialCatalog=$Catalog
-        $builder.ApplicationName='OneCPerfDiag/0.1.1'
-        $builder.ConnectTimeout=$QueryTimeoutSeconds
-        $builder.Encrypt=$true
-        $builder.TrustServerCertificate=[bool]$TrustServerCertificate
-        $builder.PersistSecurityInfo=$false
-        $builder.Pooling=$false
-        $conn=New-Object System.Data.SqlClient.SqlConnection
-        if ($null -eq $SqlCredential) {
-            $builder.IntegratedSecurity=$true
-            $conn.ConnectionString=$builder.ConnectionString
-        } else {
-            $builder.IntegratedSecurity=$false
-            $conn.ConnectionString=$builder.ConnectionString
-            $secure=$SqlCredential.Password.Copy()
-            $secure.MakeReadOnly()
-            $conn.Credential=New-Object System.Data.SqlClient.SqlCredential($SqlCredential.UserName,$secure)
-        }
-        $script:SqlConnections[$Catalog]=$conn
+        $script:SqlConnections[$Catalog]=New-OneCPerfSqlConnection -Instance $SqlInstance -Catalog $Catalog `
+            -TimeoutSeconds $QueryTimeoutSeconds -TrustCertificate ([bool]$TrustServerCertificate) -Credential $SqlCredential
     }
     $connection=$script:SqlConnections[$Catalog]
     if ($connection.State -ne [Data.ConnectionState]::Open) {
@@ -215,6 +234,7 @@ function Ensure-Space {
     if ($drive.AvailableFreeSpace -lt 512MB) { throw 'Less than 512 MiB free on output volume. Collection stopped.' }
 }
 Save-Manifest
+Write-Host ('Collector: '+$manifest.collector_version+'; source commit: '+$SourceCommit)
 Write-Host ('Output: '+$root)
 Write-Host 'Read-only pilot. Press Ctrl+C to stop. No services or tracing sessions will be left running.'
 try {
@@ -302,6 +322,18 @@ try {
     $manifest['samples_started']=$script:Tick+1
     $manifest['raw_output_bytes']=$script:OutputBytes
     $manifest['disabled_sources']=@($script:Disabled.Keys)
+    $sourceErrors=0
+    foreach ($entry in $script:Coverage.Values) { $sourceErrors += [int]$entry.error }
+    $sqlRuntimeSamples=0
+    if ($script:Coverage.ContainsKey('sql.epoch')) { $sqlRuntimeSamples=[int]$script:Coverage['sql.epoch'].ok }
+    $manifest['source_error_count']=$sourceErrors
+    $manifest['sql_runtime_sample_count']=$sqlRuntimeSamples
+    if ($sourceErrors -gt 0) {
+        Write-Warning ('Capture contains '+$sourceErrors+' source errors. Completed means the timer ended, not complete diagnostic coverage.')
+    }
+    if (-not $SkipSql -and $sqlRuntimeSamples -eq 0) {
+        Write-Warning 'SQL runtime data was NOT collected. Do not use this archive to rule out SQL problems. See coverage.html.'
+    }
     Save-Manifest
     $coverage=@($script:Coverage.Values | ForEach-Object { [pscustomobject]$_ })
     [IO.File]::WriteAllText((Join-Path $root 'coverage.json'),(ConvertTo-Json -InputObject $coverage -Depth 6),$utf8)
