@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-Portable, bounded diagnostic collection for Windows PowerShell 5.1 x64.
+Portable, bounded diagnostic collection for Windows x64: PowerShell 7 or Windows PowerShell 5.1.
 No installed services, no system/configuration changes, no user-table queries.
 SQL credentials and SQL text/plans are not written to the output.
 This is a pilot, not yet integration-tested on Windows/SQL Server.
@@ -18,19 +18,36 @@ param(
     [switch]$TrustServerCertificate,
     [switch]$SkipSql,
     [switch]$IncludeMaintenance,
+    [ValidatePattern('^$|^[0-9a-fA-F]{40}$')][string]$SourceCommit = '',
     [ValidateRange(1,15)][int]$QueryTimeoutSeconds = 3,
     [ValidateRange(16,512)][int]$MaxOutputMB = 128
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-if ($env:OS -ne 'Windows_NT' -or $PSVersionTable.PSEdition -ne 'Desktop') {
-    throw 'Use 64-bit Windows PowerShell 5.1 (powershell.exe), not pwsh.'
+if ($env:OS -ne 'Windows_NT') { throw 'Windows is required for the CIM/1C host profile.' }
+if (-not [Environment]::Is64BitProcess) { throw 'Use 64-bit PowerShell.' }
+if ($PSVersionTable.PSEdition -ne 'Desktop' -and $PSVersionTable.PSVersion.Major -lt 7) {
+    throw 'Use PowerShell 7 (pwsh.exe) or Windows PowerShell 5.1.'
 }
-if (-not [Environment]::Is64BitProcess) { throw 'Use 64-bit Windows PowerShell.' }
+if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+    throw 'Get-CimInstance is unavailable. Use a standard Windows PowerShell installation with CimCmdlets.'
+}
 if (-not $SkipSql -and [string]::IsNullOrWhiteSpace($SqlInstance)) {
     throw 'Specify -SqlInstance, or use -SkipSql for Windows/1C host metrics only.'
 }
-Add-Type -AssemblyName System.Data
+# Windows PowerShell loads the Framework provider; PS7 ships a separate SqlClient assembly.
+# No SQL module, NuGet download, compatibility process or driver install is required.
+if (-not $SkipSql) {
+    try {
+        if ($PSVersionTable.PSEdition -eq 'Desktop') { Add-Type -AssemblyName System.Data }
+        else { Add-Type -AssemblyName System.Data.SqlClient }
+        $probe = New-Object System.Data.SqlClient.SqlConnection
+        $probe.Dispose()  # Validate the provider without opening a connection.
+    } catch {
+        throw ('System.Data.SqlClient is unavailable in this PowerShell installation. ' +
+            'Use a standard Windows x64 PowerShell distribution, or -SkipSql for host metrics. ' + $_.Exception.Message)
+    }
+}
 $started = [DateTime]::UtcNow
 $hostSafe = $env:COMPUTERNAME -replace '[^A-Za-z0-9_.-]','_'
 $folderName = '{0}_{1}_{2}_{3}' -f $CaseId,$hostSafe,$started.ToString('yyyyMMddTHHmmssZ'),([guid]::NewGuid().ToString('N').Substring(0,6))
@@ -52,7 +69,10 @@ $script:LastRecord = $null
 $maxBytes = [long]$MaxOutputMB * 1MB
 $stopReason = 'interrupted_or_incomplete'
 $manifest = [ordered]@{
-    schema_version='0.1'; collector_version='0.1.0-pilot'; case_id=$CaseId;
+    schema_version='0.1'; collector_version='0.1.1-pilot'; case_id=$CaseId;
+    source_commit=$SourceCommit; powershell_version=$PSVersionTable.PSVersion.ToString();
+    powershell_edition=$PSVersionTable.PSEdition; dotnet_version=[Environment]::Version.ToString();
+    collector_sha256=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant();
     host=$env:COMPUTERNAME; role=$Role; started_utc=$started.ToString('o');
     timezone=[TimeZoneInfo]::Local.Id; utc_offset_minutes=[TimeZoneInfo]::Local.GetUtcOffset([DateTime]::Now).TotalMinutes;
     sql_instance=$SqlInstance; selected_database=$Database; skip_sql=[bool]$SkipSql;
@@ -128,7 +148,7 @@ function Get-SqlConnection {
         $builder=New-Object System.Data.SqlClient.SqlConnectionStringBuilder
         $builder.DataSource=$SqlInstance
         $builder.InitialCatalog=$Catalog
-        $builder.ApplicationName='OneCPerfDiag/0.1'
+        $builder.ApplicationName='OneCPerfDiag/0.1.1'
         $builder.ConnectTimeout=$QueryTimeoutSeconds
         $builder.Encrypt=$true
         $builder.TrustServerCertificate=[bool]$TrustServerCertificate
@@ -246,7 +266,7 @@ try {
         Collect-Source 'windows.memory' { Read-Cim 'Win32_PerfFormattedData_PerfOS_Memory' @('AvailableMBytes','PagesInputPersec','PagesOutputPersec','CommittedBytes','CommitLimit') }
         Collect-Source 'windows.system' { Read-Cim 'Win32_PerfFormattedData_PerfOS_System' @('ProcessorQueueLength','ContextSwitchesPersec','SystemUpTime') }
         Collect-Source 'windows.processes' {
-            Read-Cim 'Win32_PerfFormattedData_PerfProc_Process' @('Name','IDProcess','PercentProcessorTime','PrivateBytes','WorkingSet','IOReadBytesPersec','IOWriteBytesPersec') "Name LIKE 'sqlservr%' OR Name LIKE 'rphost%' OR Name LIKE 'rmngr%' OR Name LIKE 'ragent%' OR Name LIKE '1cv8%' OR Name LIKE 'w3wp%' OR Name LIKE 'powershell%'"
+            Read-Cim 'Win32_PerfFormattedData_PerfProc_Process' @('Name','IDProcess','PercentProcessorTime','PrivateBytes','WorkingSet','IOReadBytesPersec','IOWriteBytesPersec') "Name LIKE 'sqlservr%' OR Name LIKE 'rphost%' OR Name LIKE 'rmngr%' OR Name LIKE 'ragent%' OR Name LIKE '1cv8%' OR Name LIKE 'w3wp%' OR Name LIKE 'powershell%' OR Name LIKE 'pwsh%'"
         } -Limit 1000
         # Store RAW disk counters. The offline analyzer computes latency from deltas;
         # formatted WMI averages can lose precision for sub-second disk latencies.
