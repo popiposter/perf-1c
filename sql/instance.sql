@@ -1,0 +1,15 @@
+-- Read-only diagnostic SELECT. Do not add remediation commands.
+SELECT CONVERT(nvarchar(128),SERVERPROPERTY('ServerName')) AS server_name,
+ CONVERT(nvarchar(128),SERVERPROPERTY('MachineName')) AS machine_name,
+ CONVERT(nvarchar(128),SERVERPROPERTY('ComputerNamePhysicalNetBIOS')) AS physical_host_name,
+ CONVERT(nvarchar(128),SERVERPROPERTY('InstanceName')) AS instance_name,
+ CONVERT(nvarchar(128),SERVERPROPERTY('ProductVersion')) AS product_version,
+ CONVERT(nvarchar(128),SERVERPROPERTY('ProductLevel')) AS product_level,
+ CONVERT(nvarchar(128),SERVERPROPERTY('ProductUpdateLevel')) AS update_level,
+ CONVERT(nvarchar(128),SERVERPROPERTY('Edition')) AS edition,
+ CONVERT(int,SERVERPROPERTY('EngineEdition')) AS engine_edition,
+ CONVERT(int,SERVERPROPERTY('IsClustered')) AS is_clustered,
+ CONVERT(int,SERVERPROPERTY('IsHadrEnabled')) AS is_hadr_enabled,
+ CONVERT(varchar(40),SYSDATETIMEOFFSET(),127) AS server_time_with_offset,
+ CONVERT(varchar(33),SYSUTCDATETIME(),126) AS server_utc,
+ @@VERSION AS version_banner;

@@ -1,0 +1,46 @@
+# Local captures and reports: may contain customer data.
+output/
+analysis-output/
+captures/
+artifacts/
+.local/
+local/
+private/
+
+# Raw diagnostics, databases, backups and archives.
+*.zip
+*.7z
+*.bak
+*.trn
+*.mdf
+*.ndf
+*.ldf
+*.xel
+*.blg
+*.etl
+*.evtx
+*.sqlplan
+*.jsonl
+*.log
+
+# Credentials and local configuration.
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+
+# Python and editor-generated files.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
