@@ -6,6 +6,9 @@ artifacts/
 .local/
 local/
 private/
+# Generated maintenance packages contain internal names and storage paths.
+package_*/
+maintenance-output/
 
 # Raw diagnostics, databases, backups and archives.
 *.zip
