@@ -10,6 +10,11 @@ from pathlib import Path
 import statistics
 from typing import Any
 from zipfile import ZipFile, BadZipFile
+from workload import summarize_workload
+
+ANALYZER_VERSION = "0.2.0-pilot"
+# Internal waits are shown separately, not asserted to be harmless.
+INTERNAL_WAITS = {"SOS_WORK_DISPATCHER", "SQLTRACE_INCREMENTAL_FLUSH_SLEEP"}
 
 MAX_INPUT_BYTES = 256 * 1024 * 1024
 IDLE_WAITS = {
@@ -86,6 +91,7 @@ def read_capture(path: Path) -> tuple[dict, list[dict]]:
             if not isinstance(record, dict) or not isinstance(record.get('rows'), list):
                 raise ValueError('record must contain a rows array')
             timestamp(record['collected_utc'])
+            record["_line"] = number
             records.append(record)
         except (ValueError, KeyError, TypeError) as e:
             raise ValueError(f'Invalid records.jsonl line {number}: {e}') from e
@@ -143,8 +149,13 @@ def summarize(manifest: dict, records: list[dict]) -> dict:
         for name, delta in deltas.items(): wait_totals[name].update(delta)
     waits = sorted(({'wait_type': name, 'category': wait_category(name), **dict(values)}
                     for name, values in wait_totals.items()
-                    if name not in IDLE_WAITS and values['wait_time_ms'] > 0),
+                    if name not in IDLE_WAITS | INTERNAL_WAITS and values['wait_time_ms'] > 0),
                    key=lambda r: r['wait_time_ms'], reverse=True)
+
+    background_waits = sorted(({'wait_type': name, **dict(values)}
+        for name, values in wait_totals.items()
+        if name in IDLE_WAITS | INTERNAL_WAITS and values['wait_time_ms'] > 0),
+        key=lambda row: row['wait_time_ms'], reverse=True)
 
     io_totals: dict[tuple, Counter] = defaultdict(Counter)
     def file_key(row: dict) -> tuple:
@@ -213,7 +224,8 @@ def summarize(manifest: dict, records: list[dict]) -> dict:
     blockers = Counter(r['blocking_session_id'] for r in blocking)
     grants = [row.get('waiting_requests') or 0 for r in good('sql.grants') for row in r['rows']]
     # Only recorded observations are reported. There is intentionally no automatic "healthy" verdict.
-    observations = []
+    workload = summarize_workload(manifest, records)
+    observations = list(workload['observations'])
     if blocking:
         observations.append('В снимках есть блокируемые запросы SQL. Проверить головного блокировщика и открытую транзакцию, включая спящий сеанс.')
     if grants and max(grants) > 0:
@@ -229,7 +241,8 @@ def summarize(manifest: dict, records: list[dict]) -> dict:
                'detail': r.get('error') or 'Result exceeded row cap; interpretation is incomplete.'}
               for r in records if r['status'] != 'ok']
     return dict(
-        schema_version='0.1', manifest=manifest,
+        schema_version='0.1', analyzer_version=ANALYZER_VERSION, manifest=manifest,
+        workload=workload, background_waits=background_waits,
         interpretation='Наблюдения за интервалом, не установленная первопричина. Сравнить с временем жалобы пользователя.',
         coverage={s: dict(c) for s,c in sorted(coverage.items())}, missing_sources=missing,
         observations=observations, collection_issues=issues,
@@ -269,10 +282,24 @@ def table(rows: list[dict], columns: list[tuple[str,str]], limit: int = 50) -> s
 def render(summary: dict) -> str:
     m=summary['manifest']
     heading='1С + SQL Server · диагностический срез'
-    blocks=[f'<header><div>ДИАГНОСТИКА / ПИЛОТ 0.1</div><h1>{heading}</h1><p>'+escape(f"{m.get('case_id')} / {m.get('host')} / {m.get('started_utc')} — {m.get('ended_utc')}")+'</p></header>',
+    blocks=[f'<header><div>ДИАГНОСТИКА / АНАЛИЗАТОР 0.2</div><h1>{heading}</h1><p>'+escape(f"{m.get('case_id')} / {m.get('host')} / {m.get('started_utc')} — {m.get('ended_utc')}")+'</p></header>',
             '<section class="notice"><b>Причина ещё не установлена.</b> Этот отчёт показывает измерения и пропуски сбора. Отсутствие предупреждения не означает, что сервер исправен.</section>',
             '<h2>Наблюдения</h2>']
     for text in summary['observations']: blocks.append('<p>'+escape(text)+'</p>')
+    w = summary.get('workload', {})
+    blocks.append('<h2>Нагрузка по базам и шаблонам запросов</h2><p>Мгновенные наблюдения, не число завершений и не доля CPU. Запросы всего экземпляра; выбранная база: '+escape(str(w.get('selected_database') or 'не выбрана'))+'</p>')
+    blocks.append(table(w.get('query_groups', []), [
+        ('database_name','База'),('query_hash','Query hash'),('host_process_id','PID клиента'),
+        ('local_process_version','Версия локального процесса'),('request_observations','Наблюдений'),
+        ('max_concurrent_in_sample','Одновременно, макс.'),('max_elapsed_ms','Возраст запроса, макс. мс'),
+        ('max_cpu_ms','CPU запроса, макс. мс'),('waits_in_samples','Ожидания в снимках'),
+        ('evidence_lines','Строки records.jsonl')]))
+    for text in w.get('limitations', []): blocks.append('<p>'+escape(text)+'</p>')
+    blocks.append('<h2>Очереди SQL и память запросов</h2>')
+    blocks.append(table(w.get('scheduler_snapshots', []), [('collected_utc','UTC'),('runnable_tasks','Готовы к выполнению'),('line','Строка журнала')]))
+    blocks.append(table(w.get('memory_grant_snapshots', []), [('collected_utc','UTC'),('grant_requests','Запросов'),('waiting_requests','Ждут память'),('granted_memory_kb','Выделено, КиБ'),('line','Строка журнала')]))
+    blocks.append('<h2>Настройки экземпляра — не предписание изменять</h2>')
+    blocks.append(table(w.get('settings', []), [('name','Параметр'),('configured_value','Задано'),('running_value','Применено')]))
     blocks.append('<h2>Ресурсы гостевой ОС</h2>')
     blocks.append(table([dict(metric='CPU: среднее по снимкам, %',value=summary['cpu']['sampled_mean_percent']),
                          dict(metric='CPU: максимум в снимках, %',value=summary['cpu']['sampled_max_percent']),
@@ -280,6 +307,7 @@ def render(summary: dict) -> str:
     blocks.append('<h2>Прирост ожиданий SQL</h2><p>Экземпляр целиком. Фоновые ожидания отфильтрованы только в представлении; исходные данные сохранены. Это не проценты загрузки CPU.</p>')
     blocks.append(f'<p>Пригодных интервалов: {summary["wait_valid_intervals"]}; покрыто {summary["wait_covered_seconds"]:.1f} секунд.</p>')
     blocks.append(table(summary['waits'],[('wait_type','Ожидание'),('category','Направление проверки'),('wait_time_ms','Прирост, мс'),('waiting_tasks_count','Количество'),('signal_wait_time_ms','Signal wait, мс')],20))
+    blocks.append('<details><summary>Внутренние и фоновые ожидания: сохранены отдельно, не являются диагнозом</summary>'+table(summary.get('background_waits', []), [('wait_type','Ожидание'),('wait_time_ms','Прирост, мс')],50)+'</details>')
     blocks.append('<h2>Файлы SQL: I/O за пригодные интервалы</h2><p>Высокая задержка не определяет виновника: сопоставить с объёмом I/O, нагрузкой ОС и запросами.</p>')
     blocks.append(table(summary['sql_files'],[('database_id','База ID'),('file_id','Файл ID'),('type','Тип'),('path','Путь'),('num_of_reads','Чтений'),('avg_read_ms','Чтение, мс'),('num_of_writes','Записей'),('avg_write_ms','Запись, мс'),('covered_seconds','Покрытие, с')]))
     blocks.append('<h2>Тома Windows</h2>')
