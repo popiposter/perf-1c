@@ -23,7 +23,14 @@ param(
     [ValidateNotNullOrEmpty()][string]$Ref = 'main',
     [string]$WorkDirectory = '',
     [switch]$NonInteractive,
-    [switch]$DownloadOnly
+    [switch]$DownloadOnly,
+    [switch]$IndexAudit,
+    [ValidateRange(1,200)][int]$IndexAuditMaxIndexes = 30,
+    [ValidateRange(1,5000)][int]$IndexAuditMaxStatistics = 1000,
+    [ValidateRange(1,900)][int]$IndexAuditBudgetSeconds = 60,
+    [ValidateRange(0,1000000000)][int]$IndexAuditMinPages = 1000,
+    [ValidateRange(0,2147483647)][int]$IndexAuditObjectId = 0,
+    [ValidateSet('LIMITED','SAMPLED')][string]$IndexAuditScanMode = 'LIMITED'
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -59,6 +66,29 @@ function Get-OneCPerfCollectorParameters {
     return $forward
 }
 
+function Get-OneCIndexAuditParameters {
+    param([System.Collections.IDictionary]$Bound,[string]$Commit,[string]$Destination)
+    $forward = @{}
+    foreach ($name in @('SqlInstance','Database','CaseId','SqlCredential','TrustServerCertificate','QueryTimeoutSeconds')) {
+        if ($Bound.Keys -contains $name) { $forward[$name] = $Bound[$name] }
+    }
+    $map = @{IndexAuditMaxIndexes='MaxIndexes';IndexAuditMaxStatistics='MaxStatistics';
+        IndexAuditBudgetSeconds='BudgetSeconds';IndexAuditMinPages='MinPages';
+        IndexAuditObjectId='ObjectId';IndexAuditScanMode='ScanMode'}
+    foreach ($name in $map.Keys) {
+        if ($Bound.Keys -contains $name) { $forward[$map[$name]] = $Bound[$name] }
+    }
+    $forward.OutputDirectory = $Destination; $forward.SourceCommit = $Commit
+    return $forward
+}
+if ($IndexAudit -and ($SkipSql -or $IncludeMaintenance -or $PSBoundParameters.ContainsKey('Minutes') -or
+    $PSBoundParameters.ContainsKey('IntervalSeconds') -or $PSBoundParameters.ContainsKey('MaxOutputMB'))) {
+    throw 'IndexAudit is a separate one-shot SQL profile. Do not combine it with SkipSql, IncludeMaintenance, Minutes, IntervalSeconds or MaxOutputMB; use IndexAuditBudgetSeconds.'
+}
+if (-not $IndexAudit -and @($PSBoundParameters.Keys | Where-Object { $_ -like 'IndexAudit*' -and $_ -ne 'IndexAudit' }).Count) {
+    throw 'IndexAudit settings require -IndexAudit.'
+}
+
 # Resolve operator input before collection; no environment-specific server/base is assumed.
 # A fully parameterized invocation never prompts. An empty explicit -Database means instance scope only.
 if (-not $DownloadOnly -and -not $SkipSql) {
@@ -73,6 +103,12 @@ if (-not $DownloadOnly -and -not $SkipSql) {
         }
     }
     if (-not $Database) { Write-Warning 'No database selected: per-database details will be skipped.' }
+}
+if ($IndexAudit -and -not $DownloadOnly -and [string]::IsNullOrWhiteSpace($Database)) {
+    if ($NonInteractive) { throw 'IndexAudit requires an explicit -Database.' }
+    $Database = (Read-Host 'User database for index audit (required)').Trim()
+    if (-not $Database) { throw 'IndexAudit requires an explicit user database.' }
+    $PSBoundParameters['Database'] = $Database
 }
 if ([string]::IsNullOrWhiteSpace($WorkDirectory)) {
     if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { throw 'Specify a local -WorkDirectory.' }
@@ -94,7 +130,8 @@ Write-Host "Downloading popiposter/perf-1c @ $commit"
 Invoke-WebRequest -Uri $archiveUrl -OutFile $archivePath -TimeoutSec 120 -ErrorAction Stop
 Expand-Archive -LiteralPath $archivePath -DestinationPath $downloadRoot -ErrorAction Stop
 $sourceRoot = Join-Path $downloadRoot "perf-1c-$commit"
-$collector = Join-Path $sourceRoot 'Collect-OneCPerf.ps1'
+$collectorName = if ($IndexAudit) { 'Get-OneCIndexAudit.ps1' } else { 'Collect-OneCPerf.ps1' }
+$collector = Join-Path $sourceRoot $collectorName
 if (-not (Test-Path -LiteralPath $collector -PathType Leaf) -or
     -not (Test-Path -LiteralPath (Join-Path $sourceRoot 'sql') -PathType Container)) {
     throw 'The downloaded archive is incomplete: collector or sql directory is missing. Nothing was run.'
@@ -113,6 +150,10 @@ if ($DownloadOnly) {
     Write-Host 'Download-only: no diagnostic sources were accessed. Review the source before running Collect-OneCPerf.ps1.'
     return
 }
-$collectorParams = Get-OneCPerfCollectorParameters -Bound $PSBoundParameters -Commit $commit -Destination $OutputDirectory
+$collectorParams = if ($IndexAudit) {
+    Get-OneCIndexAuditParameters -Bound $PSBoundParameters -Commit $commit -Destination $OutputDirectory
+} else {
+    Get-OneCPerfCollectorParameters -Bound $PSBoundParameters -Commit $commit -Destination $OutputDirectory
+}
 Write-Host 'Read-only pilot. Check coverage.html after collection; errors are missing data, not a healthy result.'
 & $collector @collectorParams
